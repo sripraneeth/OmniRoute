@@ -35,7 +35,7 @@ test("Gemini -> Claude stream: text block stays open across sequential text chun
   assert.equal(result[3].delta.text, " world");
 });
 
-test("Gemini -> Claude stream: thinking chunk closes text block and emits thinking block", () => {
+test("Gemini -> Claude stream: thinking stream stays open across sequential thinking chunks", () => {
   const state = {};
   geminiToClaudeResponse(
     {
@@ -46,18 +46,42 @@ test("Gemini -> Claude stream: thinking chunk closes text block and emits thinki
     state
   );
 
-  const result = geminiToClaudeResponse(
+  const firstThinking = geminiToClaudeResponse(
     {
       candidates: [{ content: { parts: [{ thought: true, text: "Plan" }] } }],
     },
     state
   );
 
-  assert.equal(result[0].type, "content_block_stop");
-  assert.equal(result[0].index, 0);
-  assert.equal(result[1].content_block.type, "thinking");
-  assert.equal(result[2].delta.thinking, "Plan");
-  assert.equal(result[3].type, "content_block_stop");
+  assert.equal(firstThinking[0].type, "content_block_stop");
+  assert.equal(firstThinking[0].index, 0);
+  assert.equal(firstThinking[1].type, "content_block_start");
+  assert.equal(firstThinking[1].content_block.type, "thinking");
+  assert.equal(firstThinking[2].type, "content_block_delta");
+  assert.equal(firstThinking[2].delta.thinking, "Plan");
+  assert.equal(firstThinking.length, 3); // Does NOT close thinking block prematurely
+
+  const secondThinking = geminiToClaudeResponse(
+    {
+      candidates: [{ content: { parts: [{ thought: true, text: " details" }] } }],
+    },
+    state
+  );
+
+  assert.equal(secondThinking.length, 1);
+  assert.equal(secondThinking[0].type, "content_block_delta");
+  assert.equal(secondThinking[0].delta.thinking, " details");
+
+  const finish = geminiToClaudeResponse(
+    {
+      candidates: [{ finishReason: "STOP" }],
+    },
+    state
+  );
+
+  assert.equal(finish[0].type, "content_block_stop");
+  assert.equal(finish[0].index, 1);
+  assert.equal(finish[1].type, "message_delta");
 });
 
 test("Gemini -> Claude stream: functionCall becomes tool_use and MAX_TOKENS maps to max_tokens", () => {

@@ -458,13 +458,161 @@ function normalizeAntigravityGeminiSystemInstruction<T extends Record<string, un
     : { ...request, systemInstruction };
 }
 
+
+/**
+ * Vertex AI Anthropic tool repair:
+ * Ensures model turns with functionCalls are immediately followed by pure functionResponse
+ * turns (no mixed user text in the same turn). Any narrative user text is placed in an
+ * alternating turn (model: "Understood." -> user: text).
+ */
+export function repairClaudeGeminiContents(contents: unknown[]): unknown[] {
+  if (!Array.isArray(contents) || contents.length === 0) return contents;
+  const repaired: unknown[] = [];
+  for (let i = 0; i < contents.length; i++) {
+    const c = contents[i] as Record<string, unknown>;
+    repaired.push(c);
+    if (c?.role === "model" && Array.isArray(c.parts)) {
+      const calls = c.parts.filter((p: any) => p && p.functionCall && p.functionCall.name);
+      if (calls.length > 0) {
+        const next = contents[i + 1] as Record<string, unknown> | undefined;
+        if (!next || next.role !== "user") {
+          const responses = calls.map((call: any) => ({
+            functionResponse: {
+              name: call.functionCall.name,
+              response: { output: "[Tool execution completed or interrupted]" }
+            }
+          }));
+          repaired.push({ role: "user", parts: responses });
+          continue;
+        }
+        const existingResponses = (next.parts as any[] || []).filter((p: any) => p && p.functionResponse && p.functionResponse.name);
+        const existingNames = new Set(existingResponses.map((p: any) => p.functionResponse.name));
+        const missingCalls = calls.filter((call: any) => !existingNames.has(call.functionCall.name));
+        const textParts = (next.parts as any[] || []).filter((p: any) => p && p.text !== undefined);
+        if (missingCalls.length > 0 || textParts.length > 0) {
+          const pureResponses = [...existingResponses];
+          for (const call of missingCalls) {
+            pureResponses.push({
+              functionResponse: {
+                name: (call as any).functionCall.name,
+                response: { output: "[Tool execution completed or interrupted]" }
+              }
+            });
+          }
+          contents[i + 1] = {
+            ...next,
+            role: "user",
+            parts: pureResponses
+          };
+          if (textParts.length > 0) {
+            contents.splice(i + 2, 0,
+              { role: "model", parts: [{ text: "Understood." }] },
+              { role: "user", parts: textParts }
+            );
+          }
+        }
+      }
+    }
+  }
+  return repaired;
+}
+
+export function repairAnthropicMessages(rawMessages: unknown[]): unknown[] {
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return rawMessages;
+  let messages: any[];
+  try {
+    messages = JSON.parse(JSON.stringify(rawMessages));
+  } catch {
+    messages = [...rawMessages];
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role !== 'assistant') continue;
+
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    const toolUses = content.filter((b: any) => b && b.type === 'tool_use' && b.id);
+    if (toolUses.length === 0) continue;
+
+    const next = messages[i + 1];
+    if (!next || next.role !== 'user') {
+      messages.splice(i + 1, 0, {
+        role: 'user',
+        content: toolUses.map((t: any) => ({
+          type: 'tool_result',
+          tool_use_id: t.id,
+          content: '[Tool execution completed or interrupted]'
+        }))
+      });
+      continue;
+    }
+
+    const nextContent = Array.isArray(next.content)
+      ? next.content
+      : (typeof next.content === 'string' && next.content.trim() ? [{ type: 'text', text: next.content }] : []);
+
+    const existingResults = nextContent.filter((b: any) => b && b.type === 'tool_result' && b.tool_use_id);
+    const existingIds = new Set(existingResults.map((b: any) => b.tool_use_id));
+    const missingUses = toolUses.filter((t: any) => !existingIds.has(t.id));
+    const nonResultBlocks = nextContent.filter((b: any) => !b || b.type !== 'tool_result');
+
+    if (missingUses.length > 0 || nonResultBlocks.length > 0) {
+      const pureResults = [...existingResults];
+      for (const t of missingUses) {
+        pureResults.push({
+          type: 'tool_result',
+          tool_use_id: (t as any).id,
+          content: '[Tool execution completed or interrupted]'
+        });
+      }
+      messages[i + 1] = {
+        ...next,
+        role: 'user',
+        content: pureResults
+      };
+      if (nonResultBlocks.length > 0) {
+        messages.splice(i + 2, 0,
+          { role: 'assistant', content: [{ type: 'text', text: 'Understood.' }] },
+          { role: 'user', content: nonResultBlocks }
+        );
+      }
+    }
+  }
+
+  const result: any[] = [];
+  if (messages[0] && messages[0].role === 'assistant') {
+    result.push({ role: 'user', content: [{ type: 'text', text: 'Hello' }] });
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (result.length > 0 && result[result.length - 1].role === msg.role) {
+      const prev = result[result.length - 1];
+      const prevContent = Array.isArray(prev.content)
+        ? prev.content
+        : (typeof prev.content === 'string' ? [{ type: 'text', text: prev.content }] : []);
+      const curContent = Array.isArray(msg.content)
+        ? msg.content
+        : (typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : []);
+      const prevIsPureToolResult = prev.role === 'user' && prevContent.every((b: any) => b && b.type === 'tool_result');
+      if (prevIsPureToolResult) {
+        result.push({ role: 'assistant', content: [{ type: 'text', text: 'Understood.' }] });
+        result.push(msg);
+      } else {
+        prev.content = [...prevContent, ...curContent];
+      }
+    } else {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
 function sanitizeAntigravityGeminiRequest(
   request: Record<string, unknown>
 ): Record<string, unknown> {
   const clean: Record<string, unknown> = {};
 
   if (Array.isArray(request.contents)) {
-    clean.contents = request.contents;
+    clean.contents = repairClaudeGeminiContents(request.contents);
   }
 
   if (asRecord(request.systemInstruction)) {
@@ -898,6 +1046,18 @@ export class AntigravityExecutor extends BaseExecutor {
     // Harness telemetry is dropped from the inner request too (the Claude branch's
     // whitelist already omits it; the Gemini/other branches pass the request through).
     envelope.request = stripAntigravityHarnessTelemetry(envelope.request);
+
+    if (isClaude) {
+      if (Array.isArray((envelope as any).messages)) {
+        (envelope as any).messages = repairAnthropicMessages((envelope as any).messages);
+      }
+      if (envelope.request && Array.isArray((envelope.request as any).messages)) {
+        (envelope.request as any).messages = repairAnthropicMessages((envelope.request as any).messages);
+      }
+      if (envelope.request && Array.isArray((envelope.request as any).contents)) {
+        (envelope.request as any).contents = repairClaudeGeminiContents((envelope.request as any).contents);
+      }
+    }
 
     return envelope;
   }

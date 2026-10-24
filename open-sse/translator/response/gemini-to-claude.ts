@@ -223,6 +223,10 @@ function emitGroundingWebSearch(candidate, state, results) {
     results.push({ type: "content_block_stop", index: state.openTextBlockIdx });
     state.openTextBlockIdx = null;
   }
+  if (state.openThinkingBlockIdx !== null && state.openThinkingBlockIdx !== undefined) {
+    results.push({ type: "content_block_stop", index: state.openThinkingBlockIdx });
+    state.openThinkingBlockIdx = null;
+  }
 
   const queries = grounding.webSearchQueries || grounding.web_search_queries;
   const query = Array.isArray(queries) && typeof queries[0] === "string" ? queries[0] : "";
@@ -265,6 +269,7 @@ export function geminiToClaudeResponse(chunk, state) {
     state.contentBlockIndex = 0;
     // Track open text block so we can keep it open across chunks
     state.openTextBlockIdx = null;
+    state.openThinkingBlockIdx = null;
     state._markdownBuffer = "";
     state._markdownCodeSpanRun = 0;
     state._markdownTrailingBackslash = false;
@@ -300,7 +305,7 @@ export function geminiToClaudeResponse(chunk, state) {
         state.pendingThoughtSignature = hasThoughtSig;
       }
 
-      // Thinking content → thinking block (always open+close per chunk)
+      // Thinking content → thinking block (keep open across streaming chunks)
       if (isThought && part.text) {
         // Close any open text block first
         flushMarkdownBuffer(state, results);
@@ -308,18 +313,20 @@ export function geminiToClaudeResponse(chunk, state) {
           results.push({ type: "content_block_stop", index: state.openTextBlockIdx });
           state.openTextBlockIdx = null;
         }
-        const idx = state.contentBlockIndex++;
-        results.push({
-          type: "content_block_start",
-          index: idx,
-          content_block: { type: "thinking", thinking: "" },
-        });
+        if (state.openThinkingBlockIdx === null || state.openThinkingBlockIdx === undefined) {
+          const idx = state.contentBlockIndex++;
+          state.openThinkingBlockIdx = idx;
+          results.push({
+            type: "content_block_start",
+            index: idx,
+            content_block: { type: "thinking", thinking: "" },
+          });
+        }
         results.push({
           type: "content_block_delta",
-          index: idx,
+          index: state.openThinkingBlockIdx,
           delta: { type: "thinking_delta", thinking: part.text },
         });
-        results.push({ type: "content_block_stop", index: idx });
         continue;
       }
 
@@ -336,11 +343,15 @@ export function geminiToClaudeResponse(chunk, state) {
 
       // Function call → tool_use block
       if (part.functionCall) {
-        // Close any open text block first
+        // Close any open text or thinking block first
         flushMarkdownBuffer(state, results);
         if (state.openTextBlockIdx !== null) {
           results.push({ type: "content_block_stop", index: state.openTextBlockIdx });
           state.openTextBlockIdx = null;
+        }
+        if (state.openThinkingBlockIdx !== null && state.openThinkingBlockIdx !== undefined) {
+          results.push({ type: "content_block_stop", index: state.openThinkingBlockIdx });
+          state.openThinkingBlockIdx = null;
         }
         const fc = part.functionCall;
         const rawToolName = fc.name;
@@ -399,6 +410,11 @@ export function geminiToClaudeResponse(chunk, state) {
         !part.functionCall;
 
       if (isRegularText || isTextAfterThinking) {
+        // If a thinking block was open, close it before emitting text
+        if (state.openThinkingBlockIdx !== null && state.openThinkingBlockIdx !== undefined) {
+          results.push({ type: "content_block_stop", index: state.openThinkingBlockIdx });
+          state.openThinkingBlockIdx = null;
+        }
         const { cleaned, toolCalls: textToolCalls } = extractXmlInvokeBlocks(part.text, state);
 
         // Process any extracted text-format tool calls (<tool_call>, TOOL_CALL, <invoke>)
@@ -532,11 +548,15 @@ export function geminiToClaudeResponse(chunk, state) {
 
   // ── Finish reason → close open blocks + message_delta + message_stop ──
   if (candidate.finishReason) {
-    // Close any still-open text block before finishing
+    // Close any still-open text or thinking block before finishing
     flushMarkdownBuffer(state, results);
     if (state.openTextBlockIdx !== null) {
       results.push({ type: "content_block_stop", index: state.openTextBlockIdx });
       state.openTextBlockIdx = null;
+    }
+    if (state.openThinkingBlockIdx !== null && state.openThinkingBlockIdx !== undefined) {
+      results.push({ type: "content_block_stop", index: state.openThinkingBlockIdx });
+      state.openThinkingBlockIdx = null;
     }
 
     let stopReason;
